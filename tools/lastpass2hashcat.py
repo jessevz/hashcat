@@ -60,6 +60,13 @@ BATCH_HEADER_SIZE = 12
 BATCH_TYPE_DELETION = 0
 BATCH_TYPE_VALUE = 1
 
+# LevelDB table constants, see leveldb/table/format.h
+TABLE_FOOTER_SIZE = 48
+TABLE_TRAILER_SIZE = 5  # one compression byte plus a four byte checksum
+TABLE_MAGIC = (0xDB4775248B80FB57).to_bytes(8, "little")
+TABLE_COMPRESSION_NONE = 0
+TABLE_COMPRESSION_SNAPPY = 1
+
 # V8 serialization tags, see v8/src/objects/value-serializer.cc
 V8_TAG_ONE_BYTE_STRING = 0x22  # '"'
 V8_TAG_UTF8_STRING = 0x53      # 'S'
@@ -424,6 +431,149 @@ def leveldb_parse_iterations(buf):
     return None
 
 
+def _snappy_decompress(data):
+    """Decompress a snappy block, LevelDB compresses its table blocks with it by default"""
+    expected, offset = _read_varint(data, 0)
+    if expected is None:
+        return None
+
+    out = bytearray()
+
+    while offset < len(data):
+        tag = data[offset]
+        offset += 1
+
+        if tag & 0x03 == 0:
+            # Literal, the length is either packed in the tag or in the bytes that follow
+            length = tag >> 2
+            if length >= 60:
+                extra = length - 59
+                if offset + extra > len(data):
+                    return None
+                length = int.from_bytes(data[offset:offset + extra], "little")
+                offset += extra
+            length += 1
+
+            if offset + length > len(data):
+                return None
+
+            out += data[offset:offset + length]
+            offset += length
+            continue
+
+        # Copy, back reference into what has been emitted so far
+        if tag & 0x03 == 1:
+            if offset >= len(data):
+                return None
+            length = 4 + ((tag >> 2) & 0x07)
+            copy_offset = ((tag >> 5) << 8) | data[offset]
+            offset += 1
+        elif tag & 0x03 == 2:
+            if offset + 2 > len(data):
+                return None
+            length = (tag >> 2) + 1
+            copy_offset = int.from_bytes(data[offset:offset + 2], "little")
+            offset += 2
+        else:
+            if offset + 4 > len(data):
+                return None
+            length = (tag >> 2) + 1
+            copy_offset = int.from_bytes(data[offset:offset + 4], "little")
+            offset += 4
+
+        if copy_offset == 0 or copy_offset > len(out):
+            return None
+
+        start = len(out) - copy_offset
+        for index in range(length):
+            out.append(out[start + index])
+
+    if len(out) != expected:
+        return None
+
+    return bytes(out)
+
+
+def _leveldb_read_block(data, offset, size):
+    """Read one table block and decompress it, the byte after the block names the compression"""
+    if offset + size + TABLE_TRAILER_SIZE > len(data):
+        return None
+
+    block = data[offset:offset + size]
+    compression = data[offset + size]
+
+    if compression == TABLE_COMPRESSION_NONE:
+        return block
+
+    if compression == TABLE_COMPRESSION_SNAPPY:
+        return _snappy_decompress(block)
+
+    # zstd and zlib are possible in newer forks, neither is what Chrome writes
+    return None
+
+
+def _leveldb_block_handles(block):
+    """Yield the (offset, size) block handles stored as the values of an index block"""
+    if len(block) < 4:
+        return
+
+    # The block ends with a restart array, its length is the last four bytes
+    restart_count = int.from_bytes(block[-4:], "little")
+    end = len(block) - 4 - (restart_count * 4)
+    if end <= 0:
+        return
+
+    offset = 0
+    while offset < end:
+        shared, offset = _read_varint(block, offset)
+        non_shared, offset = _read_varint(block, offset)
+        value_length, offset = _read_varint(block, offset)
+
+        if shared is None or non_shared is None or value_length is None:
+            return
+        if offset + non_shared + value_length > len(block):
+            return
+
+        offset += non_shared
+        value = block[offset:offset + value_length]
+        offset += value_length
+
+        block_offset, handle_offset = _read_varint(value, 0)
+        block_size, _ = _read_varint(value, handle_offset)
+
+        if block_offset is not None and block_size is not None:
+            yield block_offset, block_size
+
+
+def leveldb_table_blocks(data):
+    """Yield the decompressed data blocks of a LevelDB table (.ldb/.sst) file"""
+    if len(data) < TABLE_FOOTER_SIZE:
+        return
+
+    footer = data[-TABLE_FOOTER_SIZE:]
+
+    if footer[-8:] != TABLE_MAGIC:
+        return
+
+    # The footer holds the metaindex handle followed by the index handle
+    _, offset = _read_varint(footer, 0)
+    _, offset = _read_varint(footer, offset)
+    index_offset, offset = _read_varint(footer, offset)
+    index_size, _ = _read_varint(footer, offset)
+
+    if index_offset is None or index_size is None:
+        return
+
+    index_block = _leveldb_read_block(data, index_offset, index_size)
+    if index_block is None:
+        return
+
+    for block_offset, block_size in _leveldb_block_handles(index_block):
+        block = _leveldb_read_block(data, block_offset, block_size)
+        if block:
+            yield block
+
+
 def leveldb_files(path):
     """Return the LevelDB files to inspect, a single file or every file of a store directory"""
     if os.path.isfile(path):
@@ -441,28 +591,55 @@ def leveldb_files(path):
     return entries
 
 
-def leveldb_parse(path):
+def leveldb_values(data):
+    """Return the stored values of a LevelDB file, and how they were recovered"""
+    # A write ahead log, every value comes back exactly as it was written
+    batches = list(leveldb_log_records(data))
+    values = [value for batch in batches for value in leveldb_batch_values(batch)]
+    if values:
+        return values, f"log, {len(batches)} batches"
+
+    # A compacted table, the blocks have to be decompressed before anything is readable
+    blocks = list(leveldb_table_blocks(data))
+    if blocks:
+        return blocks, f"table, {len(blocks)} blocks"
+
+    # Neither, fall back to scanning the raw bytes
+    return [data], "raw scan"
+
+
+def leveldb_parse(path, debug=False):
     """Parse a Chrome IndexedDB LevelDB store, return (iterations, [(iv_hex, ciphertext_hex)])"""
     blobs = []
     iterations = None
 
     for file_name in leveldb_files(path):
         data = open_file(file_name)
+        values, how = leveldb_values(data)
 
-        # Values of a .log file are recoverable exactly, everything else is scanned as is
-        values = list(leveldb_log_records(data))
-        values = [value for batch in values for value in leveldb_batch_values(batch)]
-
-        if not values:
-            values = [data]
-
+        found = []
         for value in values:
             for blob in leveldb_parse_encrypted_usernames(value):
-                if blob not in blobs:
-                    blobs.append(blob)
+                if blob not in blobs and blob not in found:
+                    found.append(blob)
 
             if iterations is None:
                 iterations = leveldb_parse_iterations(value)
+
+        blobs.extend(found)
+
+        if debug:
+            names = sorted({
+                field
+                for field in ENCRYPTED_USERNAME_FIELDS + ITERATIONS_FIELDS
+                for value in values
+                if next(_field_offsets(value, field), None) is not None
+            })
+            print(
+                f"{os.path.basename(file_name):<20} {len(data):>10} bytes  "
+                f"{how:<20} fields={','.join(names) or '-'}  blobs={len(found)}",
+                file=sys.stderr,
+            )
 
     return iterations, blobs
 
@@ -473,15 +650,28 @@ def main():
     options = [arg for arg in sys.argv[1:] if arg.startswith("--")]
 
     forced_iterations = None
+    debug = False
     for option in options:
         if option.startswith("--iterations="):
             forced_iterations = int(option.split("=", 1)[1])
+        elif option == "--debug":
+            debug = True
         else:
             sys.exit(f"Unknown option {option}")
 
+    usage = (
+        f"Usage: {sys.argv[0]} <xml, sqlite or LevelDB file/directory> <username (email)> [--iterations=N] [--debug]"
+    )
+
+    if not argv:
+        sys.exit(usage)
+
     if len(argv) < 2:
+        # The e-mail is not in the vault in plain text, it is both the PBKDF2 salt and the
+        # plaintext hashcat encrypts to compare against, so it has to be named on the command line
         sys.exit(
-            f"Usage: {sys.argv[0]} <xml, sqlite or LevelDB file/directory> <username (email)> [--iterations=N]"
+            f"Missing the account e-mail, it is the salt of the hash and cannot be read from "
+            f"{argv[0]}\n{usage}\nFor example: {sys.argv[0]} {argv[0]} you@example.com"
         )
 
     file_name = argv[0]
@@ -527,12 +717,14 @@ def main():
         con.close()
     else:
         # Browser Extension, Chrome IndexedDB (LevelDB) storage
-        iterations, blobs = leveldb_parse(file_name)
+        iterations, blobs = leveldb_parse(file_name, debug)
 
         if not blobs:
             sys.exit(
-                f"Found no encryptedUsername field in {file_name}, "
-                "expected an LPB64 file, a SQLite database or a LevelDB store"
+                f"Found no encryptedUsername field in {file_name}\n"
+                "Expected an LPB64 file, a SQLite database or a LevelDB store. Re-run with "
+                "--debug to see which files were read and how\n"
+                "Note the e-mail argument plays no part in this, it is only copied into the output"
             )
 
         if forced_iterations is None and iterations is None:
