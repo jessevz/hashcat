@@ -407,6 +407,66 @@ def _reject_reason(iv_b64, ciphertext_b64):
     return f"ciphertext is {len(ciphertext)} bytes, not a whole number of blocks"
 
 
+def _vault_encu_blob(vault):
+    """Walk the chunks of an LPAV vault and return the blob of its ENCU chunk"""
+    offset = 0
+
+    while offset + 8 <= len(vault):
+        identifier = vault[offset:offset + 4]
+        size = int.from_bytes(vault[offset + 4:offset + 8], "big")
+        offset += 8
+
+        if size > len(vault) - offset:
+            return None
+
+        if identifier == b"ENCU":
+            # ENCU holds the account e-mail encrypted with the key derived from the password
+            return next(_cbc_blobs_in(vault[offset:offset + size]), None)
+
+        offset += size
+
+    return None
+
+
+def _find_vaults(buf):
+    """Find LPAV vaults in a buffer, stored either as raw bytes or base64"""
+    vaults = []
+
+    for haystack in (buf, buf.replace(b"\x00", b"")):
+        start = 0
+        while True:
+            found = haystack.find(b"LPAV", start)
+            if found < 0:
+                break
+            vaults.append(haystack[found:])
+            start = found + 1
+
+        # base64 of "LPAV" starts with TFBBV, that is how the vault sits in the extension storage
+        for match in re.finditer(rb"TFBBV[A-Za-z0-9+/]+={0,2}", haystack):
+            encoded = match.group(0)
+            try:
+                decoded = b64decode(encoded + b"=" * (-len(encoded) % 4))
+            except Exception:
+                continue
+
+            if decoded.startswith(b"LPAV"):
+                vaults.append(decoded)
+
+    return vaults
+
+
+def leveldb_parse_vaults(buf):
+    """Return the ENCU blob of every LPAV vault in a value, that is the account e-mail"""
+    blobs = []
+
+    for vault in _find_vaults(buf):
+        blob = _vault_encu_blob(vault)
+        if blob and blob not in blobs:
+            blobs.append(blob)
+
+    return blobs
+
+
 def leveldb_parse_encrypted_usernames(buf, rejects=None):
     """Find the LastPass blobs of one IndexedDB value, anchored to the field name and not"""
     anchored = []
@@ -438,6 +498,11 @@ def leveldb_parse_encrypted_usernames(buf, rejects=None):
 
 def leveldb_parse_iterations(buf):
     """Find the PBKDF2 iteration count of a single IndexedDB value"""
+    # The extension stores the vault as "iterations=NNN;<base64>", same as the old SQLite row
+    result = search(rb"iterations=(\d{1,7});", buf.replace(b"\x00", b""))
+    if result:
+        return int(result.group(1))
+
     for field in ITERATIONS_FIELDS:
         for offset in _field_offsets(buf, field):
             value = _v8_number_at(buf, offset)
@@ -690,6 +755,9 @@ def leveldb_parse(path, debug=False):
 
         for value in values:
             anchored, unanchored = leveldb_parse_encrypted_usernames(value, rejects)
+
+            # An LPAV vault names its chunks, so its ENCU chunk is the account e-mail for certain
+            anchored = leveldb_parse_vaults(value) + anchored
 
             for blob in anchored:
                 if blob not in found:
