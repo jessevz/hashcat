@@ -17,6 +17,10 @@ directory (or at a single .log/.ldb file inside it), e.g.:
   ~/.config/google-chrome/Default/IndexedDB/
       chrome-extension_hdokiejnpimakedhajhdlcegeplioahd_0.indexeddb.leveldb/
 
+Values too large for LevelDB are written to the sibling .indexeddb.blob
+directory instead, that one is picked up automatically. Pass --debug to see
+which files were read and how.
+
 Tested OK with:
 - LastPass for Android (com.lastpass.lpandroid) v5.12.0.10004
 - LastPass for Chrome v4.101.1
@@ -574,19 +578,39 @@ def leveldb_table_blocks(data):
             yield block
 
 
+def blob_directory(path):
+    """Return the .blob directory Chrome keeps next to a .leveldb directory, if there is one"""
+    base = os.path.normpath(path)
+
+    # Values too large to sit in LevelDB are written to <origin>.indexeddb.blob instead
+    if not base.endswith(".leveldb"):
+        return None
+
+    sibling = base[:-len(".leveldb")] + ".blob"
+
+    return sibling if os.path.isdir(sibling) else None
+
+
 def leveldb_files(path):
-    """Return the LevelDB files to inspect, a single file or every file of a store directory"""
+    """Return the files to inspect, a single file or every file under a store directory"""
     if os.path.isfile(path):
         return [path]
 
+    roots = [path]
+
+    sibling = blob_directory(path)
+    if sibling:
+        roots.append(sibling)
+
     entries = []
-    for name in sorted(os.listdir(path)):
-        # LOCK, LOG and CURRENT never hold vault data
-        if name in ("LOCK", "LOG", "LOG.old", "CURRENT"):
-            continue
-        full_path = os.path.join(path, name)
-        if os.path.isfile(full_path):
-            entries.append(full_path)
+    for root in roots:
+        # Blob directories nest the files below a database id, so walk the whole tree
+        for directory, _, names in os.walk(root):
+            for name in sorted(names):
+                # LOCK, LOG and CURRENT never hold vault data
+                if name in ("LOCK", "LOG", "LOG.old", "CURRENT"):
+                    continue
+                entries.append(os.path.join(directory, name))
 
     return entries
 
@@ -604,8 +628,22 @@ def leveldb_values(data):
     if blocks:
         return blocks, f"table, {len(blocks)} blocks"
 
-    # Neither, fall back to scanning the raw bytes
+    # An externally stored value, Chrome may write the whole blob file as one snappy stream
+    decompressed = _snappy_decompress(data)
+    if decompressed:
+        return [decompressed, data], "snappy blob"
+
+    # Nothing structural to go on, fall back to scanning the raw bytes
     return [data], "raw scan"
+
+
+def _display_path(root, file_name):
+    """Shorten a path for the debug listing, relative to the store when possible"""
+    parent = os.path.dirname(os.path.normpath(root))
+    try:
+        return os.path.relpath(file_name, parent)
+    except ValueError:
+        return file_name
 
 
 def leveldb_parse(path, debug=False):
@@ -620,13 +658,14 @@ def leveldb_parse(path, debug=False):
         found = []
         for value in values:
             for blob in leveldb_parse_encrypted_usernames(value):
-                if blob not in blobs and blob not in found:
+                if blob not in found:
                     found.append(blob)
 
             if iterations is None:
                 iterations = leveldb_parse_iterations(value)
 
-        blobs.extend(found)
+        # found counts what this file holds, the same vault is usually in several of them
+        blobs.extend(blob for blob in found if blob not in blobs)
 
         if debug:
             names = sorted({
@@ -636,7 +675,7 @@ def leveldb_parse(path, debug=False):
                 if next(_field_offsets(value, field), None) is not None
             })
             print(
-                f"{os.path.basename(file_name):<20} {len(data):>10} bytes  "
+                f"{_display_path(path, file_name):<40} {len(data):>10} bytes  "
                 f"{how:<20} fields={','.join(names) or '-'}  blobs={len(found)}",
                 file=sys.stderr,
             )
