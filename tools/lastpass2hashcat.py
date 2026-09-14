@@ -370,25 +370,46 @@ def _decode_cbc_blob(iv_b64, ciphertext_b64):
     return initialization_vector.hex(), ciphertext[:16].hex()
 
 
-def _cbc_blobs_in(buf):
+def _cbc_blobs_in(buf, rejects=None):
     """Yield every (iv_hex, ciphertext_hex) LastPass blob found in a byte buffer"""
-    for match in CBC_BLOB_RE.finditer(buf):
-        blob = _decode_cbc_blob(match.group(1), match.group(2))
-        if blob:
-            yield blob
+    for regex, strip in ((CBC_BLOB_RE, False), (CBC_BLOB_UTF16_RE, True)):
+        for match in regex.finditer(buf):
+            iv_b64, ciphertext_b64 = match.group(1), match.group(2)
+            if strip:
+                iv_b64 = iv_b64.replace(b"\x00", b"")
+                ciphertext_b64 = ciphertext_b64.replace(b"\x00", b"")
 
-    for match in CBC_BLOB_UTF16_RE.finditer(buf):
-        blob = _decode_cbc_blob(
-            match.group(1).replace(b"\x00", b""),
-            match.group(2).replace(b"\x00", b""),
-        )
-        if blob:
-            yield blob
+            blob = _decode_cbc_blob(iv_b64, ciphertext_b64)
+            if blob:
+                yield blob
+            elif rejects is not None:
+                rejects.append((iv_b64[:24], ciphertext_b64[:24], _reject_reason(iv_b64, ciphertext_b64)))
 
 
-def leveldb_parse_encrypted_usernames(buf):
-    """Find the encryptedUsername blobs of a single IndexedDB value"""
-    blobs = []
+def _reject_reason(iv_b64, ciphertext_b64):
+    """Explain why a !<iv>|<ciphertext> candidate was not usable, for --debug"""
+    try:
+        initialization_vector = b64decode(iv_b64, validate=True)
+    except Exception:
+        return "iv is not base64"
+
+    try:
+        ciphertext = b64decode(ciphertext_b64, validate=True)
+    except Exception:
+        return "ciphertext is not base64"
+
+    if len(initialization_vector) != 16:
+        return f"iv is {len(initialization_vector)} bytes, not 16"
+
+    if len(ciphertext) < 16:
+        return f"ciphertext is {len(ciphertext)} bytes, under one block"
+
+    return f"ciphertext is {len(ciphertext)} bytes, not a whole number of blocks"
+
+
+def leveldb_parse_encrypted_usernames(buf, rejects=None):
+    """Find the LastPass blobs of one IndexedDB value, anchored to the field name and not"""
+    anchored = []
 
     for field in ENCRYPTED_USERNAME_FIELDS:
         for offset in _field_offsets(buf, field):
@@ -401,11 +422,18 @@ def leveldb_parse_encrypted_usernames(buf):
                 candidates.append(value.encode("latin-1", "ignore"))
 
             for candidate in candidates:
-                for blob in _cbc_blobs_in(candidate):
-                    if blob not in blobs:
-                        blobs.append(blob)
+                for blob in _cbc_blobs_in(candidate, rejects):
+                    if blob not in anchored:
+                        anchored.append(blob)
 
-    return blobs
+    # The field name may be stored apart from its value, or spelled differently, so also take
+    # every LastPass blob in the value. A vault holds one per secret, hence these stay separate.
+    unanchored = []
+    for blob in _cbc_blobs_in(buf, rejects):
+        if blob not in anchored and blob not in unanchored:
+            unanchored.append(blob)
+
+    return anchored, unanchored
 
 
 def leveldb_parse_iterations(buf):
@@ -649,6 +677,7 @@ def _display_path(root, file_name):
 def leveldb_parse(path, debug=False):
     """Parse a Chrome IndexedDB LevelDB store, return (iterations, [(iv_hex, ciphertext_hex)])"""
     blobs = []
+    others = []
     iterations = None
 
     for file_name in leveldb_files(path):
@@ -656,16 +685,25 @@ def leveldb_parse(path, debug=False):
         values, how = leveldb_values(data)
 
         found = []
+        loose = []
+        rejects = [] if debug else None
+
         for value in values:
-            for blob in leveldb_parse_encrypted_usernames(value):
+            anchored, unanchored = leveldb_parse_encrypted_usernames(value, rejects)
+
+            for blob in anchored:
                 if blob not in found:
                     found.append(blob)
+            for blob in unanchored:
+                if blob not in loose:
+                    loose.append(blob)
 
             if iterations is None:
                 iterations = leveldb_parse_iterations(value)
 
         # found counts what this file holds, the same vault is usually in several of them
         blobs.extend(blob for blob in found if blob not in blobs)
+        others.extend(blob for blob in loose if blob not in others)
 
         if debug:
             names = sorted({
@@ -675,12 +713,25 @@ def leveldb_parse(path, debug=False):
                 if next(_field_offsets(value, field), None) is not None
             })
             print(
-                f"{_display_path(path, file_name):<40} {len(data):>10} bytes  "
-                f"{how:<20} fields={','.join(names) or '-'}  blobs={len(found)}",
+                f"{_display_path(path, file_name):<40} {len(data):>9} bytes  "
+                f"{how:<20} fields={','.join(names) or '-':<32} "
+                f"named={len(found)} loose={len(loose)}",
                 file=sys.stderr,
             )
 
-    return iterations, blobs
+            seen = []
+            for reject in rejects:
+                if reject not in seen:
+                    seen.append(reject)
+
+            for iv_b64, ciphertext_b64, reason in seen[:3]:
+                print(
+                    f"    rejected !{iv_b64.decode('latin-1')}|"
+                    f"{ciphertext_b64.decode('latin-1')}... {reason}",
+                    file=sys.stderr,
+                )
+
+    return iterations, blobs, others
 
 
 def main():
@@ -756,13 +807,25 @@ def main():
         con.close()
     else:
         # Browser Extension, Chrome IndexedDB (LevelDB) storage
-        iterations, blobs = leveldb_parse(file_name, debug)
+        iterations, blobs, others = leveldb_parse(file_name, debug)
+
+        if not blobs and others:
+            # Nothing carried the encryptedUsername name, fall back to every LastPass blob found
+            print(
+                f"Warning: found no encryptedUsername field, falling back to all {len(others)} "
+                "encrypted values found. A vault holds one per secret, so most of these are "
+                "passwords and notes, not the account e-mail. Try each line against -m 6800, "
+                "only the account e-mail one can crack",
+                file=sys.stderr,
+            )
+            blobs = others
 
         if not blobs:
             sys.exit(
-                f"Found no encryptedUsername field in {file_name}\n"
+                f"Found no usable LastPass encrypted value in {file_name}\n"
                 "Expected an LPB64 file, a SQLite database or a LevelDB store. Re-run with "
-                "--debug to see which files were read and how\n"
+                "--debug to see which files were read, which fields they hold and why any "
+                "!<iv>|<ciphertext> candidate was rejected\n"
                 "Note the e-mail argument plays no part in this, it is only copied into the output"
             )
 
