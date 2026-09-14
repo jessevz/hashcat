@@ -455,6 +455,29 @@ def _find_vaults(buf):
     return vaults
 
 
+def blob_context(buf, counts, samples, limit=72):
+    """Record the identifier sitting in front of every LastPass blob, to show how a vault is shaped
+
+    Only identifiers and structural punctuation are kept, never the ciphertext itself, so the
+    result is safe to share when asking why a particular vault does not parse.
+    """
+    flat = buf.replace(b"\x00", b"")
+
+    for match in CBC_BLOB_RE.finditer(flat):
+        before = flat[max(0, match.start() - limit):match.start()]
+
+        tokens = re.findall(rb"[A-Za-z_][A-Za-z0-9_]{2,}", before)
+        name = tokens[-1].decode("latin-1") if tokens else "(nothing readable)"
+        counts[name] = counts.get(name, 0) + 1
+
+        if len(samples) < 3:
+            # Printable rendering of the run up, every other byte becomes a dot
+            preview = "".join(
+                chr(byte) if 32 <= byte < 127 else "." for byte in before[-40:]
+            )
+            samples.append(f"{preview}  <-- blob starts here")
+
+
 def leveldb_parse_vaults(buf):
     """Return the ENCU blob of every LPAV vault in a value, that is the account e-mail"""
     blobs = []
@@ -752,6 +775,8 @@ def leveldb_parse(path, debug=False):
         found = []
         loose = []
         rejects = [] if debug else None
+        contexts = {}
+        samples = []
 
         for value in values:
             anchored, unanchored = leveldb_parse_encrypted_usernames(value, rejects)
@@ -765,6 +790,9 @@ def leveldb_parse(path, debug=False):
             for blob in unanchored:
                 if blob not in loose:
                     loose.append(blob)
+
+            if debug:
+                blob_context(value, contexts, samples)
 
             if iterations is None:
                 iterations = leveldb_parse_iterations(value)
@@ -798,6 +826,16 @@ def leveldb_parse(path, debug=False):
                     f"{ciphertext_b64.decode('latin-1')}... {reason}",
                     file=sys.stderr,
                 )
+
+            # Nothing was named, so show what does sit in front of the blobs instead
+            if not found and contexts:
+                print("    what precedes each blob:", file=sys.stderr)
+                ranked = sorted(contexts.items(), key=lambda item: -item[1])
+                for name, count in ranked[:10]:
+                    print(f"      {count:>5} x {name}", file=sys.stderr)
+
+                for sample in samples:
+                    print(f"      sample: {sample}", file=sys.stderr)
 
     return iterations, blobs, others
 
