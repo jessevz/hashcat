@@ -46,7 +46,7 @@ const char *module_st_pass        (MAYBE_UNUSED const hashconfig_t *hashconfig, 
 
 const char *module_usage_notice (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSED const user_options_t *user_options, MAYBE_UNUSED const user_options_extra_t *user_options_extra)
 {
-  return "The hash used here is not the one sent via e.g. the web interface to LastPass servers (pbkdf2_sha256_hex (pbkdf2_sha256 ($pass, $email, $iterations), $pass, 1) but instead the one stored (by e.g. your browser or the pocket version) to disk. For instance, Opera and Chrome store the hash in local SQLite databases; Firefox uses files ending with 'lpall.slps' - for Linux: 2nd line is interesting / base64 decode it; for Windows, see https://hashcat.net/forum/thread-2701-post-16111.html#pid16111 - and_key.itr";
+  return "The hash used here is not the one sent via e.g. the web interface to LastPass servers (pbkdf2_sha256_hex (pbkdf2_sha256 ($pass, $email, $iterations), $pass, 1) but instead the one stored (by e.g. your browser or the pocket version) to disk. For instance, older Opera and Chrome extensions store the hash in local SQLite databases, newer ones keep it in Chrome's IndexedDB (a LevelDB store, see tools/lastpass2hashcat.py); Firefox uses files ending with 'lpall.slps' - for Linux: 2nd line is interesting / base64 decode it; for Windows, see https://hashcat.net/forum/thread-2701-post-16111.html#pid16111 - and_key.itr";
 }
 
 typedef struct lastpass

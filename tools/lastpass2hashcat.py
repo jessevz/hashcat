@@ -2,13 +2,20 @@
 # -*- coding: utf-8 -*-
 
 # Author: hansvh <6390369+hans-vh@users.noreply.github.com>
-# Version: 0.0.6
+# Version: 0.0.7
 # License: MIT
 
 """
 Files can be found here:
 Android: /data/data/com.lastpass.lpandroid/files
 Others: See https://support.lastpass.com/help/where-is-my-lastpass-data-stored-on-my-computer-lp070008
+
+Newer Chromium based extensions no longer use SQLite, they keep the vault in
+Chrome's IndexedDB, which is a LevelDB store. Point this script at the
+directory (or at a single .log/.ldb file inside it), e.g.:
+
+  ~/.config/google-chrome/Default/IndexedDB/
+      chrome-extension_hdokiejnpimakedhajhdlcegeplioahd_0.indexeddb.leveldb/
 
 Tested OK with:
 - LastPass for Android (com.lastpass.lpandroid) v5.12.0.10004
@@ -17,11 +24,49 @@ Tested OK with:
 - LastPass for Firefox v4.101.0
 """
 
-import sys
 import os
+import re
+import struct
+import sys
 import sqlite3
 from base64 import b64decode
 from re import search
+
+# Default used when the vault does not carry an explicit iterations value
+DEFAULT_ITERATIONS = 100100
+
+# LastPass stores the encrypted account e-mail as !<IV_base64>|<ciphertext_base64>
+_B64 = rb"[A-Za-z0-9+/]+={0,2}"
+CBC_BLOB_RE = re.compile(rb"!(" + _B64 + rb")\|(" + _B64 + rb")")
+CBC_BLOB_UTF16_RE = re.compile(
+    rb"!\x00((?:[A-Za-z0-9+/]\x00)+(?:=\x00){0,2})\|\x00((?:[A-Za-z0-9+/]\x00)+(?:=\x00){0,2})"
+)
+
+# Field names the Chromium extension uses inside the IndexedDB records
+ENCRYPTED_USERNAME_FIELDS = ("encryptedUsername",)
+ITERATIONS_FIELDS = ("iterations", "key_iter", "keyIterations")
+
+# LevelDB write ahead log constants, see leveldb/db/log_format.h
+LOG_BLOCK_SIZE = 32768
+LOG_HEADER_SIZE = 7
+LOG_TYPE_ZERO = 0
+LOG_TYPE_FULL = 1
+LOG_TYPE_FIRST = 2
+LOG_TYPE_MIDDLE = 3
+LOG_TYPE_LAST = 4
+
+# LevelDB write batch record types, see leveldb/db/dbformat.h
+BATCH_HEADER_SIZE = 12
+BATCH_TYPE_DELETION = 0
+BATCH_TYPE_VALUE = 1
+
+# V8 serialization tags, see v8/src/objects/value-serializer.cc
+V8_TAG_ONE_BYTE_STRING = 0x22  # '"'
+V8_TAG_UTF8_STRING = 0x53      # 'S'
+V8_TAG_TWO_BYTE_STRING = 0x63  # 'c'
+V8_TAG_INT32 = 0x49            # 'I'
+V8_TAG_UINT32 = 0x55           # 'U'
+V8_TAG_DOUBLE = 0x4E           # 'N'
 
 
 def parse_encu(data):
@@ -112,32 +157,355 @@ def sqlite_parse_firefox(cur):
     return iterations, encu
 
 
+#
+# LevelDB (Chrome IndexedDB) support
+#
+
+
+def _crc32c(data, table=[]):
+    """CRC-32C (Castagnoli), the checksum LevelDB puts in front of every log record"""
+    if not table:
+        for index in range(256):
+            crc = index
+            for _ in range(8):
+                crc = (crc >> 1) ^ (0x82F63B78 if crc & 1 else 0)
+            table.append(crc)
+
+    crc = 0xFFFFFFFF
+    for byte in data:
+        crc = table[(crc ^ byte) & 0xFF] ^ (crc >> 8)
+
+    return crc ^ 0xFFFFFFFF
+
+
+def _mask_crc(crc):
+    """LevelDB stores checksums rotated and offset so they never collide with real data"""
+    return (((crc >> 15) | (crc << 17)) + 0xA282EAD8) & 0xFFFFFFFF
+
+
+def _read_varint(buf, offset):
+    """Read a protobuf style varint, return (value, new offset) or (None, offset) on truncation"""
+    value = 0
+    shift = 0
+    while offset < len(buf):
+        byte = buf[offset]
+        offset += 1
+        value |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return value, offset
+        shift += 7
+        if shift > 63:
+            break
+
+    return None, offset
+
+
+def _read_length_prefixed(buf, offset):
+    """Read a varint length followed by that many bytes"""
+    length, offset = _read_varint(buf, offset)
+    if length is None or offset + length > len(buf):
+        return None, offset
+
+    return buf[offset:offset + length], offset + length
+
+
+def leveldb_log_records(data):
+    """Yield the write batches stored in a LevelDB write ahead log file"""
+    offset = 0
+    pending = bytearray()
+
+    while offset + LOG_HEADER_SIZE <= len(data):
+        block_offset = offset % LOG_BLOCK_SIZE
+
+        # The last few bytes of a block are zero padding, they never hold a header
+        if LOG_BLOCK_SIZE - block_offset < LOG_HEADER_SIZE:
+            offset += LOG_BLOCK_SIZE - block_offset
+            continue
+
+        crc, length, record_type = struct.unpack_from("<IHB", data, offset)
+
+        if record_type == LOG_TYPE_ZERO or offset + LOG_HEADER_SIZE + length > len(data):
+            offset += LOG_BLOCK_SIZE - block_offset
+            pending.clear()
+            continue
+
+        payload = data[offset + LOG_HEADER_SIZE:offset + LOG_HEADER_SIZE + length]
+
+        if _mask_crc(_crc32c(bytes([record_type]) + payload)) != crc:
+            # Corrupt record, LevelDB itself drops the remainder of the block as well
+            offset += LOG_BLOCK_SIZE - block_offset
+            pending.clear()
+            continue
+
+        offset += LOG_HEADER_SIZE + length
+
+        if record_type == LOG_TYPE_FULL:
+            yield bytes(payload)
+        elif record_type == LOG_TYPE_FIRST:
+            pending = bytearray(payload)
+        elif record_type == LOG_TYPE_MIDDLE:
+            pending.extend(payload)
+        elif record_type == LOG_TYPE_LAST:
+            pending.extend(payload)
+            yield bytes(pending)
+            pending = bytearray()
+
+
+def leveldb_batch_values(batch):
+    """Yield the values of a LevelDB write batch, deletions carry no value"""
+    if len(batch) < BATCH_HEADER_SIZE:
+        return
+
+    offset = BATCH_HEADER_SIZE
+    while offset < len(batch):
+        record_type = batch[offset]
+        offset += 1
+
+        if record_type not in (BATCH_TYPE_DELETION, BATCH_TYPE_VALUE):
+            return
+
+        key, offset = _read_length_prefixed(batch, offset)
+        if key is None:
+            return
+
+        if record_type == BATCH_TYPE_DELETION:
+            continue
+
+        value, offset = _read_length_prefixed(batch, offset)
+        if value is None:
+            return
+
+        yield value
+
+
+def _v8_string_at(buf, offset):
+    """Decode a V8 serialized string at offset, return None when there is no string there"""
+    if offset >= len(buf):
+        return None
+
+    tag = buf[offset]
+    length, offset = _read_varint(buf, offset + 1)
+    if length is None or offset + length > len(buf):
+        return None
+
+    raw = buf[offset:offset + length]
+
+    try:
+        if tag == V8_TAG_ONE_BYTE_STRING:
+            return raw.decode("latin-1")
+        if tag == V8_TAG_UTF8_STRING:
+            return raw.decode("utf-8")
+        if tag == V8_TAG_TWO_BYTE_STRING:
+            return raw.decode("utf-16-le")
+    except UnicodeDecodeError:
+        return None
+
+    return None
+
+
+def _v8_number_at(buf, offset):
+    """Decode a V8 serialized number at offset, return None when there is no number there"""
+    if offset >= len(buf):
+        return None
+
+    tag = buf[offset]
+
+    if tag == V8_TAG_INT32:
+        value, _ = _read_varint(buf, offset + 1)
+        if value is None:
+            return None
+        # int32 values are zigzag encoded
+        return (value >> 1) ^ -(value & 1)
+
+    if tag == V8_TAG_UINT32:
+        value, _ = _read_varint(buf, offset + 1)
+        return value
+
+    if tag == V8_TAG_DOUBLE:
+        if offset + 9 > len(buf):
+            return None
+        return struct.unpack_from("<d", buf, offset + 1)[0]
+
+    return None
+
+
+def _field_offsets(buf, name):
+    """Yield the offsets just past every occurrence of a field name, ASCII and UTF-16LE"""
+    for encoded in (name.encode("ascii"), name.encode("utf-16-le")):
+        start = 0
+        while True:
+            found = buf.find(encoded, start)
+            if found < 0:
+                break
+            yield found + len(encoded)
+            start = found + 1
+
+
+def _decode_cbc_blob(iv_b64, ciphertext_b64):
+    """Turn a !<IV>|<ciphertext> pair into hex, or return None when it is not a LastPass blob"""
+    try:
+        initialization_vector = b64decode(iv_b64, validate=True)
+        ciphertext = b64decode(ciphertext_b64, validate=True)
+    except Exception:
+        return None
+
+    if len(initialization_vector) != 16:
+        return None
+
+    if len(ciphertext) < 16 or len(ciphertext) % 16:
+        return None
+
+    # Only the first ciphertext block is needed, that is all the kernel compares against
+    return initialization_vector.hex(), ciphertext[:16].hex()
+
+
+def _cbc_blobs_in(buf):
+    """Yield every (iv_hex, ciphertext_hex) LastPass blob found in a byte buffer"""
+    for match in CBC_BLOB_RE.finditer(buf):
+        blob = _decode_cbc_blob(match.group(1), match.group(2))
+        if blob:
+            yield blob
+
+    for match in CBC_BLOB_UTF16_RE.finditer(buf):
+        blob = _decode_cbc_blob(
+            match.group(1).replace(b"\x00", b""),
+            match.group(2).replace(b"\x00", b""),
+        )
+        if blob:
+            yield blob
+
+
+def leveldb_parse_encrypted_usernames(buf):
+    """Find the encryptedUsername blobs of a single IndexedDB value"""
+    blobs = []
+
+    for field in ENCRYPTED_USERNAME_FIELDS:
+        for offset in _field_offsets(buf, field):
+            # The field name is directly followed by its value, decode it the way V8 wrote it
+            value = _v8_string_at(buf, offset)
+
+            # JSON, UTF-16 or any other wrapping is covered by scanning the bytes that follow
+            candidates = [buf[offset:offset + 4096]]
+            if value:
+                candidates.append(value.encode("latin-1", "ignore"))
+
+            for candidate in candidates:
+                for blob in _cbc_blobs_in(candidate):
+                    if blob not in blobs:
+                        blobs.append(blob)
+
+    return blobs
+
+
+def leveldb_parse_iterations(buf):
+    """Find the PBKDF2 iteration count of a single IndexedDB value"""
+    for field in ITERATIONS_FIELDS:
+        for offset in _field_offsets(buf, field):
+            value = _v8_number_at(buf, offset)
+
+            if value is None:
+                text = _v8_string_at(buf, offset)
+                if text is None:
+                    # Fall back to whatever digits directly follow the field name
+                    window = buf[offset:offset + 32].replace(b"\x00", b"")
+                    result = search(rb"^[^0-9]{0,8}([0-9]{1,7})", window)
+                    text = result.group(1).decode("ascii") if result else None
+
+                try:
+                    value = int(text)
+                except (TypeError, ValueError):
+                    continue
+
+            value = int(value)
+
+            if 1 <= value <= 1000000:
+                return value
+
+    return None
+
+
+def leveldb_files(path):
+    """Return the LevelDB files to inspect, a single file or every file of a store directory"""
+    if os.path.isfile(path):
+        return [path]
+
+    entries = []
+    for name in sorted(os.listdir(path)):
+        # LOCK, LOG and CURRENT never hold vault data
+        if name in ("LOCK", "LOG", "LOG.old", "CURRENT"):
+            continue
+        full_path = os.path.join(path, name)
+        if os.path.isfile(full_path):
+            entries.append(full_path)
+
+    return entries
+
+
+def leveldb_parse(path):
+    """Parse a Chrome IndexedDB LevelDB store, return (iterations, [(iv_hex, ciphertext_hex)])"""
+    blobs = []
+    iterations = None
+
+    for file_name in leveldb_files(path):
+        data = open_file(file_name)
+
+        # Values of a .log file are recoverable exactly, everything else is scanned as is
+        values = list(leveldb_log_records(data))
+        values = [value for batch in values for value in leveldb_batch_values(batch)]
+
+        if not values:
+            values = [data]
+
+        for value in values:
+            for blob in leveldb_parse_encrypted_usernames(value):
+                if blob not in blobs:
+                    blobs.append(blob)
+
+            if iterations is None:
+                iterations = leveldb_parse_iterations(value)
+
+    return iterations, blobs
+
+
 def main():
     """Entry point"""
-    if len(sys.argv) < 3:
-        sys.exit(f"Usage: {sys.argv[0]} <xml or sqlite file> <username (email)>")
+    argv = [arg for arg in sys.argv[1:] if not arg.startswith("--")]
+    options = [arg for arg in sys.argv[1:] if arg.startswith("--")]
 
-    file_name = sys.argv[1]
+    forced_iterations = None
+    for option in options:
+        if option.startswith("--iterations="):
+            forced_iterations = int(option.split("=", 1)[1])
+        else:
+            sys.exit(f"Unknown option {option}")
+
+    if len(argv) < 2:
+        sys.exit(
+            f"Usage: {sys.argv[0]} <xml, sqlite or LevelDB file/directory> <username (email)> [--iterations=N]"
+        )
+
+    file_name = argv[0]
     if not os.path.exists(file_name):
         sys.exit(f"File {file_name} does not exist")
-
-    file_content = open_file(file_name)
-    magic_bytes = file_content[:5].decode("utf-8")
 
     # Output will contain the following fields (in order), colon separated
     encrypted_email = ""
     iterations = -1
-    email = sys.argv[2].lower()
+    email = argv[1].lower()
     initialization_vector = ""
+
+    magic_bytes = ""
+    if os.path.isfile(file_name):
+        magic_bytes = open_file(file_name)[:5].decode("utf-8", "replace")
 
     if magic_bytes == "LPB64":
         # Android App
-        iterations = 100100
-        xml = b64decode(file_content[5:])
+        iterations = DEFAULT_ITERATIONS
+        xml = b64decode(open_file(file_name)[5:])
         initialization_vector, encrypted_email = parse_vault(xml)
 
     elif magic_bytes == "SQLit":
-        # Browser Extension
+        # Browser Extension, older SQLite based storage
         con = sqlite3.connect(file_name)
         cur = con.cursor()
 
@@ -149,7 +517,8 @@ def main():
         # Then try Firefox
         if not encrypted_email or not iterations or not initialization_vector:
             iterations, encu = sqlite_parse_firefox(cur)
-            initialization_vector, encrypted_email = parse_encu(encu)
+            if encu:
+                initialization_vector, encrypted_email = parse_encu(encu)
 
         # Finally give up
         if not encrypted_email or not iterations or not initialization_vector:
@@ -157,7 +526,30 @@ def main():
 
         con.close()
     else:
-        sys.exit(f"Expected LPB64 or SQLit in file, but found {magic_bytes}")
+        # Browser Extension, Chrome IndexedDB (LevelDB) storage
+        iterations, blobs = leveldb_parse(file_name)
+
+        if not blobs:
+            sys.exit(
+                f"Found no encryptedUsername field in {file_name}, "
+                "expected an LPB64 file, a SQLite database or a LevelDB store"
+            )
+
+        if forced_iterations is None and iterations is None:
+            print(
+                f"Warning: no iterations field found, assuming {DEFAULT_ITERATIONS}",
+                file=sys.stderr,
+            )
+
+        iterations = forced_iterations or iterations or DEFAULT_ITERATIONS
+
+        for initialization_vector, encrypted_email in blobs:
+            print(f"{encrypted_email}:{iterations}:{email}:{initialization_vector}")
+
+        return
+
+    if forced_iterations is not None:
+        iterations = forced_iterations
 
     print(f"{encrypted_email}:{iterations}:{email}:{initialization_vector}")
 
