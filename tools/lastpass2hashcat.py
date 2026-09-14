@@ -50,6 +50,12 @@ CBC_BLOB_UTF16_RE = re.compile(
 ENCRYPTED_USERNAME_FIELDS = ("encryptedUsername",)
 ITERATIONS_FIELDS = ("iterations", "key_iter", "keyIterations")
 
+# Newer extensions persist a redux style store, each record is {slice: <name>, data: <blob>}.
+# The blob is named "data" whatever it holds, the sibling slice name says which one it is.
+SLICE_FIELD = "slice"
+SLICE_DATA_FIELD = "data"
+ACCOUNT_SLICES = ("user",)
+
 # LevelDB write ahead log constants, see leveldb/db/log_format.h
 LOG_BLOCK_SIZE = 32768
 LOG_HEADER_SIZE = 7
@@ -455,6 +461,37 @@ def _find_vaults(buf):
     return vaults
 
 
+def leveldb_parse_slices(buf):
+    """Return the (slice name, blob) pairs of a redux style record"""
+    pairs = []
+
+    for offset in _field_offsets(buf, SLICE_FIELD):
+        name = _v8_string_at(buf, offset)
+        if not name:
+            continue
+
+        # The data field follows its slice name, so only look a short way ahead
+        window = buf[offset:offset + 4096]
+
+        data_offset = next(_field_offsets(window, SLICE_DATA_FIELD), None)
+        if data_offset is None:
+            continue
+
+        value = _v8_string_at(window, data_offset)
+
+        candidates = [window[data_offset:data_offset + 4096]]
+        if value:
+            candidates.append(value.encode("latin-1", "ignore"))
+
+        for candidate in candidates:
+            blob = next(_cbc_blobs_in(candidate), None)
+            if blob:
+                pairs.append((name, blob))
+                break
+
+    return pairs
+
+
 def blob_context(buf, counts, samples, limit=72):
     """Record the identifier sitting in front of every LastPass blob, to show how a vault is shaped
 
@@ -762,7 +799,7 @@ def _display_path(root, file_name):
         return file_name
 
 
-def leveldb_parse(path, debug=False):
+def leveldb_parse(path, debug=False, wanted_slice=None):
     """Parse a Chrome IndexedDB LevelDB store, return (iterations, [(iv_hex, ciphertext_hex)])"""
     blobs = []
     others = []
@@ -777,12 +814,23 @@ def leveldb_parse(path, debug=False):
         rejects = [] if debug else None
         contexts = {}
         samples = []
+        slices = {}
 
         for value in values:
             anchored, unanchored = leveldb_parse_encrypted_usernames(value, rejects)
 
             # An LPAV vault names its chunks, so its ENCU chunk is the account e-mail for certain
             anchored = leveldb_parse_vaults(value) + anchored
+
+            # A redux record is named by its slice, the account slice holds the account e-mail
+            for name, blob in leveldb_parse_slices(value):
+                slices.setdefault(name, [])
+                if blob not in slices[name]:
+                    slices[name].append(blob)
+
+                if name == wanted_slice or (wanted_slice is None and name in ACCOUNT_SLICES):
+                    if blob not in anchored:
+                        anchored.append(blob)
 
             for blob in anchored:
                 if blob not in found:
@@ -827,6 +875,13 @@ def leveldb_parse(path, debug=False):
                     file=sys.stderr,
                 )
 
+            if slices:
+                print("    slices holding a blob:", file=sys.stderr)
+                for name, blobs_of_slice in sorted(slices.items()):
+                    mark = " <-- used" if name == wanted_slice or (
+                        wanted_slice is None and name in ACCOUNT_SLICES) else ""
+                    print(f"      {len(blobs_of_slice):>5} x {name}{mark}", file=sys.stderr)
+
             # Nothing was named, so show what does sit in front of the blobs instead
             if not found and contexts:
                 print("    what precedes each blob:", file=sys.stderr)
@@ -847,16 +902,19 @@ def main():
 
     forced_iterations = None
     debug = False
+    wanted_slice = None
     for option in options:
         if option.startswith("--iterations="):
             forced_iterations = int(option.split("=", 1)[1])
         elif option == "--debug":
             debug = True
+        elif option.startswith("--slice="):
+            wanted_slice = option.split("=", 1)[1]
         else:
             sys.exit(f"Unknown option {option}")
 
     usage = (
-        f"Usage: {sys.argv[0]} <xml, sqlite or LevelDB file/directory> <username (email)> [--iterations=N] [--debug]"
+        f"Usage: {sys.argv[0]} <xml, sqlite or LevelDB file/directory> <username (email)> [--iterations=N] [--slice=NAME] [--debug]"
     )
 
     if not argv:
@@ -913,7 +971,7 @@ def main():
         con.close()
     else:
         # Browser Extension, Chrome IndexedDB (LevelDB) storage
-        iterations, blobs, others = leveldb_parse(file_name, debug)
+        iterations, blobs, others = leveldb_parse(file_name, debug, wanted_slice)
 
         if not blobs and others:
             # Nothing carried the encryptedUsername name, fall back to every LastPass blob found
