@@ -1239,7 +1239,7 @@ EMU_OBJS_ALL            += emu_inc_hash_base58
 # the escape's walk over the packed pool, so the host reports what the device matched from one source
 EMU_OBJS_ALL            += emu_inc_pcfg emu_inc_pcfg_omen
 
-OBJS_ALL                := affinity autotune backend benchmark bitmap bitops bridges combinator common convert cpt cpu_crc32 cpu_features debugfile dispatch dynamicx dynloader event ext_ADL ext_cuda ext_hip ext_nvml ext_nvrtc ext_hiprtc ext_OpenCL ext_openssl ext_sysfs_amdgpu ext_sysfs_intelgpu ext_sysfs_cpu ext_iconv ext_lzma ext_zlib ext_zstd feed filehandling folder hashcat hashes hlfmt hwmon induct interface json keyboard_layout locking logfile loopback memchr memory monitor mpsp outfile_check outfile parser path paw64 pidfile plugin_abi potfile pubkey pwpipe recipe restore rp rp_cpu selftest slow_candidates shared status stdout straight generic system terminal thread timer tuningdb usage user_options wordlist $(EMU_OBJS_ALL)
+OBJS_ALL                := affinity autotune backend benchmark bitmap bitops bridges combinator common convert cpt cpu_crc32 cpu_features debugfile dispatch dispatch_sched dynamicx dynloader event ext_ADL ext_cuda ext_hip ext_nvml ext_nvrtc ext_hiprtc ext_OpenCL ext_openssl ext_sysfs_amdgpu ext_sysfs_intelgpu ext_sysfs_cpu ext_iconv ext_lzma ext_zlib ext_zstd feed filehandling folder hashcat hashes hlfmt hwmon induct interface json keyboard_layout locking logfile loopback memchr memory monitor mpsp outfile_check outfile parser path paw64 pidfile plugin_abi potfile pubkey pwpipe recipe restore rp rp_cpu selftest slow_candidates shared status stdout straight generic system terminal thread timer tuningdb usage user_options wordlist $(EMU_OBJS_ALL)
 
 ifeq ($(ENABLE_BRAIN),1)
 OBJS_ALL                += brain
@@ -1661,8 +1661,17 @@ default: $(HASHCAT_FRONTEND) modules bridges feeds
 version:
 	@echo $(VERSION_TAG)
 
+# dispatch_sim drives the keyspace scheduler over simulated devices. It needs no backend and no GPU,
+# which is the point of it: how a schedule behaves across a fleet is otherwise only visible to
+# somebody who owns the fleet. See tools/dispatch_sim.c.
+
+.PHONY: dispatch_sim
+dispatch_sim: tools/dispatch_sim.c src/dispatch_sched.c
+	$(CC) $(CFLAGS) -I include/ -I OpenCL/ -I deps/OpenCL-Headers -o dispatch_sim $^
+
 .PHONY: clean
 clean:
+	$(RM) -f dispatch_sim
 	$(RM) -f $(HASHCAT_FRONTEND)
 	$(RM) -f $(HASHCAT_LIBRARY)
 	$(RM) -f libhashcat.so.*

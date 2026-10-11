@@ -18,6 +18,7 @@
 #include "rp_cpu.h"
 #include "slow_candidates.h"
 #include "dispatch.h"
+#include "dispatch_sched.h"
 #include "feed_ctx.h"
 #include "convert.h"
 #include "user_options.h"
@@ -175,26 +176,10 @@ static int set_kernel_power_final (hashcat_ctx_t *hashcat_ctx, const u64 kernel_
 
 static u64 get_power (backend_ctx_t *backend_ctx, hc_device_param_t *device_param)
 {
-  const u64 kernel_power_final = backend_ctx->kernel_power_final;
-
-  if (kernel_power_final)
-  {
-    const double device_factor = (double) device_param->hardware_power / backend_ctx->hardware_power_all;
-
-    const u64 words_left_device = (u64) CEIL (kernel_power_final * device_factor);
-
-    // work should be at least the hardware power available without any accelerator
-
-    const u64 work = MAX (words_left_device, device_param->hardware_power);
-
-    // we need to make sure the value is not larger than the regular kernel_power
-
-    const u64 work_final = MIN (work, device_param->kernel_power);
-
-    return work_final;
-  }
-
-  return device_param->kernel_power;
+  return dispatch_slice (backend_ctx->kernel_power_final,
+                         device_param->hardware_power,
+                         backend_ctx->hardware_power_all,
+                         device_param->kernel_power);
 }
 
 static u64 get_work (hashcat_ctx_t *hashcat_ctx, hc_device_param_t *device_param, const u64 max)
@@ -213,28 +198,23 @@ static u64 get_work (hashcat_ctx_t *hashcat_ctx, hc_device_param_t *device_param
 
   device_param->words_off = words_off;
 
-  const u64 kernel_power_all = backend_ctx->kernel_power_all;
+  u64 kernel_power_final = backend_ctx->kernel_power_final;
 
-  // words_off can start beyond the keyspace. The brain sets it to the highest position the session
-  // has already reached, and a later run of the same attack can have a smaller keyspace: fewer rules,
-  // a tighter --limit, a wordlist that shrank. Unsigned subtraction then wraps to about 1.8e19, work
-  // never runs out and the attack never finishes.
+  bool latched = false;
 
-  const u64 words_left = (words_off < words_base) ? words_base - words_off : 0;
+  u64 work = dispatch_take (&kernel_power_final,
+                            words_off,
+                            words_base,
+                            backend_ctx->kernel_power_all,
+                            backend_ctx->hardware_power_all,
+                            device_param->hardware_power,
+                            device_param->kernel_power,
+                            max,
+                            &latched);
 
-  if (words_left < kernel_power_all)
-  {
-    if (backend_ctx->kernel_power_final == 0)
-    {
-      set_kernel_power_final (hashcat_ctx, words_left);
-    }
-  }
+  // the latch is reported once, and dispatch_take () has already sized this slice against it
 
-  const u64 kernel_power = get_power (backend_ctx, device_param);
-
-  u64 work = MIN (words_left, kernel_power);
-
-  work = MIN (work, max);
+  if (latched == true) set_kernel_power_final (hashcat_ctx, kernel_power_final);
 
   // -a 9 pairs word N with salt N, and a feed that covers several rounds writes them round major, so
   // the pairing is word N with salt N modulo the salt count. What the kernel is told is the batch's
